@@ -30,7 +30,7 @@
 
 | Layer | Technology | Rationale |
 |---|---|---|
-| **Frontend** | React 18 + Vite + Tailwind CSS | Already initialized in repo. Fast HMR, utility-first CSS, responsive out-of-box |
+| **Frontend** | React 18 + Vite + Tailwind CSS + react-icons | Already initialized in repo. Fast HMR, utility-first CSS, responsive out-of-box |
 | **Backend** | **Python 3.12 + FastAPI** | Auto-generated Swagger docs, native async, Pydantic validation built-in, best AI agent code generation |
 | **ORM** | **SQLAlchemy 2.0 (async)** | Industry-standard Python ORM, explicit relationship control, excellent PostgreSQL support |
 | **Migrations** | **Alembic** | Versioned, reviewable migration files with upgrade/downgrade, full control over every schema change |
