@@ -153,6 +153,9 @@ async def lifespan(app: FastAPI):
 | Admin dashboard metrics | `dashboard:admin` | 2 min | Any mutation |
 | Exam question count | `exam:{id}:qcount` | 10 min | Question add/delete |
 
+> [!IMPORTANT]
+> **Session Sync Strategy:** Phase 1 uses `active_session_id` in PostgreSQL for single-device login enforcement. When adding Redis caching for sessions, the `get_current_user()` dependency must be updated to: (1) check Redis first (cache-aside), (2) fall back to PostgreSQL on cache miss, (3) on login/logout, invalidate the Redis session key **immediately** alongside the PostgreSQL update. If Redis becomes the primary session store, explicitly deprecate the `active_session_id` PostgreSQL column to avoid split-brain authentication states where a session is valid in one store but expired in the other.
+
 **Cache-aside pattern:**
 ```python
 # app/services/exam_service.py — example usage
@@ -895,13 +898,14 @@ from app.models.user import User
 router = APIRouter(prefix="/notifications", tags=["Notifications"])
 
 # In-memory connection store (use Redis pub/sub for multi-worker)
-active_connections: dict[str, asyncio.Queue] = {}
+# Maps user_id → list of queues (one per browser tab/connection)
+active_connections: dict[str, list[asyncio.Queue]] = {}
 
 
 async def notification_event_generator(user_id: str, request: Request):
     """SSE generator — yields events as they arrive."""
     queue = asyncio.Queue()
-    active_connections[user_id] = queue
+    active_connections.setdefault(user_id, []).append(queue)
 
     try:
         while True:
@@ -918,7 +922,13 @@ async def notification_event_generator(user_id: str, request: Request):
                 yield f"event: heartbeat\ndata: ping\n\n"
 
     finally:
-        active_connections.pop(user_id, None)
+        # Remove only THIS connection's queue, not all connections for the user
+        if user_id in active_connections:
+            active_connections[user_id] = [
+                q for q in active_connections[user_id] if q is not queue
+            ]
+            if not active_connections[user_id]:
+                del active_connections[user_id]
 
 
 @router.get("/stream")
@@ -939,8 +949,9 @@ async def notification_stream(
 
 # Called by notification_service when creating a notification
 async def push_to_user(user_id: str, notification: dict):
-    queue = active_connections.get(user_id)
-    if queue:
+    """Push notification to ALL active connections for a user (handles multiple tabs)."""
+    queues = active_connections.get(user_id, [])
+    for queue in queues:
         await queue.put(notification)
 ```
 

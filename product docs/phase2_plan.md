@@ -145,11 +145,15 @@ async def upload_image(
 **Modify `ExamAttempt.jsx`:** Render question images above question text.  
 **Modify `SolutionView.jsx`:** Render question images in review.
 
+> [!IMPORTANT]
+> **Image Cleanup on Question Deletion/Update:** When a question with an `image_url` is deleted (`DELETE /teacher/exams/{exam_id}/questions/{id}`) or its image is replaced via update (`PATCH`), the service layer must call `storage_service.delete_image(old_public_id)` to remove the orphaned image from Cloudinary. Store the Cloudinary `public_id` alongside `image_url` in the `Question` model (add `image_public_id: Mapped[Optional[str]]` column) to enable cleanup.
+
 **Deliverables after Task 1:**
 - ✅ Teachers can upload images to questions (max 5MB)
 - ✅ Images display during exam and in solution view
 - ✅ Images optimized and served via Cloudinary CDN
 - ✅ Storage service is swappable (abstract interface)
+- ✅ Orphaned images cleaned up on question delete/update
 
 ---
 
@@ -295,8 +299,8 @@ async def get_exam_analytics(exam_id: uuid.UUID, teacher_id: uuid.UUID, db: Asyn
         "exam_name": exam.name,
         "total_attempts": len(attempts),
         "avg_score": round(sum(scores) / len(scores), 2),
-        "max_score": max(scores),
-        "min_score": min(scores),
+        "max_score": max(scores, default=0),
+        "min_score": min(scores, default=0),
         "total_possible_marks": total_marks,
         "score_distribution": distribution,
         "avg_time_taken": round(sum(a[0].time_taken_seconds or 0 for a in attempts) / len(attempts) / 60, 1),

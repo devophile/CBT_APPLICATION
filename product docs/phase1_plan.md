@@ -15,7 +15,7 @@
 | All 3 roles (Admin, Teacher, Student) | Image uploads for questions |
 | Full auth with JWT + OTP email | Bilingual (Bengali) UI rendering |
 | Super Admin panel (teacher CRUD, student mgmt, coin mgmt, config) | Analytics charts & graphs |
-| Teacher: student linking, batch CRUD, exam CRUD, sections, questions | Email notifications (low balance alerts) |
+| Teacher: student linking, batch CRUD, exam CRUD, sections, questions | Email notifications / Notification panel UI |
 | Student: registration, home page, exam browsing, full exam attempt, results | CSV/PDF export |
 | Wallet system (credit, debit, balance checks, transaction history) | SEO landing page (marketing) |
 | Exam cost calculation & deduction (atomic transactions) | Cloudinary/S3 integration |
@@ -27,6 +27,9 @@
 
 > [!IMPORTANT]
 > **Phase 1 is bilingual-schema-ready.** The database stores Bengali fields (`qn_bn`, `op_bn_*`), but the UI does not render the language toggle in Phase 1. Teachers can enter bilingual content — it will render properly when Phase 2 ships the toggle. This avoids a database migration between phases.
+
+> [!NOTE]
+> **Notification records ARE created in Phase 1.** When a student is blocked from a private exam due to insufficient teacher wallet balance, the `start_exam` flow creates a `Notification` record in the database (see `technical_prd.md` § 5.5). The notification panel UI (bell icon, dropdown, mark-as-read) is deferred to Phase 2. Teachers can check their wallet transaction history in Phase 1 to understand why deductions stopped.
 
 ---
 
@@ -553,6 +556,7 @@ async def credit_wallet(
         transaction_type=TransactionType.credit, credit_type=credit_type,
         amount=amount, reason=TransactionReason.admin_credit,
         description=description, balance_after=new_balance,
+        created_by=uuid.UUID(admin_id),  # Audit: which admin issued this credit
     ))
 
     return success_response({"balance": float(new_balance)}, "Coins credited")
@@ -812,11 +816,12 @@ Same as [technical_prd.md](./technical_prd.md) — StudentLayout, StudentHome (c
 | Edge Case | Implementation |
 |---|---|
 | Teacher adds unregistered email → student registers later | On registration, query `teacher_students` by `invited_email` → flip to active |
-| Teacher soft-deleted → exams hidden | All exam queries filter `teacher.is_deleted == False` |
+| Teacher soft-deleted → exams hidden | Create shared `get_active_exams_query()` in `exam_service.py` that auto-applies `is_deleted == False` + teacher soft-delete join filter. All student-facing endpoints must use this query builder. |
 | Student inactive → blocked from everything | `get_current_user` dependency checks `is_active` on every request |
 | Mid-exam browser close | Client-side only — answers lost, attempt stays `is_submitted=False` |
-| Race condition: concurrent exam start | `UniqueConstraint("exam_id", "student_id")` + `with_for_update()` row lock |
+| Race condition: concurrent exam start | `UniqueConstraint("exam_id", "student_id")` + `with_for_update()` row lock on Exam row (serializes concurrent requests). Wrap `db.flush()` in `try/except IntegrityError` → return `409 Conflict` as defense-in-depth. |
 | Negative wallet balance prevention | Wallet check inside same transaction as deduction |
+| Negative marks entered as negative number | Pydantic schema enforces `positive_marks > 0` and `negative_marks >= 0` (use `ge=0`) to prevent score formula inversion |
 
 #### 5.2 Shared UI Components
 

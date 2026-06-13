@@ -811,6 +811,7 @@ class Transaction(Base, UUIDMixin):
     description: Mapped[Optional[str]] = mapped_column(String(500))
     reference_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
     balance_after: Mapped[Decimal] = mapped_column(Numeric(12, 4))
+    created_by: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))  # Audit: admin who issued credit
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
 
     wallet: Mapped["Wallet"] = relationship(back_populates="transactions")
@@ -882,6 +883,7 @@ class Exam(Base, UUIDMixin, TimestampMixin):
     )
     positive_marks: Mapped[Decimal] = mapped_column(Numeric(5, 2))
     negative_marks: Mapped[Decimal] = mapped_column(Numeric(5, 2), default=Decimal("0"))
+    # ⚠️ Pydantic schema (CreateExamRequest) must enforce: positive_marks > 0, negative_marks >= 0
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
     is_locked: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -1420,6 +1422,9 @@ class LoginResponse(BaseModel):
 | `GET` | `/teacher/wallet` | — | Wallet balance |
 | `GET` | `/teacher/wallet/transactions` | `?page, limit, type` | History |
 
+> [!WARNING]
+> **Bilingual Validation on Exam Update:** When `PATCH /teacher/exams/{id}` changes the `language` field from `single` to `bilingual`, the service layer must validate that **all existing questions** have non-null Bengali fields (`qn_bn`, `op_bn_1` through `op_bn_4`). If any question is missing Bengali content, reject the update with `400: "All questions must have Bengali translations before switching to bilingual mode."` This prevents empty text rendering on the student exam UI.
+
 ### 5.4 Student Routes (`/api/v1/student`)
 > All routes require `get_current_user` + `require_role("student")`
 
@@ -1577,7 +1582,13 @@ async def start_exam(
         if not exam.is_locked:
             exam.is_locked = True
 
-        await db.flush()  # Get attempt.id
+        try:
+            await db.flush()  # Get attempt.id
+        except IntegrityError:  # from sqlalchemy.exc import IntegrityError
+            # Defense-in-depth: UniqueConstraint(exam_id, student_id) caught
+            # The with_for_update() lock above prevents this in normal operation,
+            # but this handles edge cases gracefully instead of returning 500.
+            raise HTTPException(409, "You have already attempted this exam")
 
         # 10. Prepare questions (EXCLUDE correct answers)
         questions_out = [
