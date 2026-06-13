@@ -99,15 +99,27 @@ class RedisCacheService(ICacheService):
 
 
 class InMemoryCacheService(ICacheService):
-    """Fallback for local dev without Redis."""
+    """Fallback for local dev without Redis.
+
+    NOTE: This implementation enforces TTL using expiry timestamps checked on get().
+    Cached values are evicted lazily when accessed after expiry.
+    """
     def __init__(self):
-        self._store: dict[str, Any] = {}
+        self._store: dict[str, tuple[Any, float]] = {}  # key -> (value, expires_at)
 
     async def get(self, key: str) -> Optional[Any]:
-        return self._store.get(key)
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        value, expires_at = entry
+        if expires_at and time.time() > expires_at:
+            del self._store[key]  # Lazy eviction
+            return None
+        return value
 
     async def set(self, key: str, value: Any, ttl_seconds: int = 300) -> None:
-        self._store[key] = value
+        expires_at = time.time() + ttl_seconds if ttl_seconds else 0
+        self._store[key] = (value, expires_at)
 
     async def delete(self, key: str) -> None:
         self._store.pop(key, None)
@@ -124,6 +136,9 @@ def get_cache_service() -> ICacheService:
         return RedisCacheService()
     return InMemoryCacheService()
 ```
+
+> [!IMPORTANT]
+> **Add `import time` at the top of `cache_service.py`** alongside the other imports. The `InMemoryCacheService` requires it for TTL expiry checks.
 
 **FastAPI lifespan integration:**
 ```python
@@ -382,10 +397,25 @@ jobs:
 
 #### 2.2 Test Suite
 
-**Install test dependencies:**
+**Install test dependencies (dev only — NOT in production requirements):**
 ```bash
-pip install pytest pytest-asyncio httpx ruff pytest-cov
+# In development only
+pip install pytest pytest-asyncio httpx pytest-cov
+pip install ruff  # Linting
+pip freeze > requirements-dev.txt
 ```
+
+> [!IMPORTANT]
+> **Use separate requirements files** to keep the production Docker image lean:
+> - `requirements.txt` — production dependencies only (fastapi, sqlalchemy, uvicorn, etc.)
+> - `requirements-dev.txt` — dev/test deps: `pytest`, `pytest-asyncio`, `httpx`, `pytest-cov`, `ruff`, `locust`
+>
+> The `Dockerfile.production` must only install from `requirements.txt`:
+> ```dockerfile
+> COPY requirements.txt .
+> RUN pip install --no-cache-dir -r requirements.txt
+> ```
+> Installing test tools in production adds ~150MB to the image and increases attack surface.
 
 **`backend/tests/conftest.py`:**
 ```python
@@ -615,6 +645,20 @@ async def start_exam(request: Request, exam_id: uuid.UUID, ...):
 async def upload_image(request: Request, ...):
     ...
 ```
+
+> [!IMPORTANT]
+> **Every route decorated with `@limiter.limit()` must have `request: Request` as its first parameter.** SlowAPI reads the client IP from the request object. Missing this parameter causes a startup error.
+>
+> Routes that use the **global default limiter** (`"200/15minutes"`) do NOT need this change. Only individually decorated routes need it.
+>
+> **Affected routes across the codebase:**
+> | File | Routes needing `request: Request` added |
+> |---|---|
+> | `app/api/auth.py` | `admin_login`, `teacher_login`, `student_login`, `register_student`, `verify_otp`, `forgot_password` |
+> | `app/api/student.py` | `start_exam` |
+> | `app/api/upload.py` | `upload_image` |
+>
+> For each of these, add `request: Request` **before** all other parameters, then import `from fastapi import Request` if not already imported.
 
 #### 3.2 Security Middleware
 
@@ -992,8 +1036,35 @@ export function useNotificationStream() {
 }
 ```
 
-> [!NOTE]
-> For multi-worker deployments (e.g., Render with 2+ workers), replace the in-memory `active_connections` dict with **Redis Pub/Sub**. Each worker subscribes to a Redis channel, and `push_to_user()` publishes to the channel instead.
+> [!IMPORTANT]
+> **Multi-worker SSE requires Redis Pub/Sub.** Phase 3 deploys with `--workers 4`. The in-memory `active_connections` dict is local to each worker process. A notification pushed from Worker A will NOT reach connections held by Workers B, C, or D.
+>
+> **Production implementation — replace `push_to_user` with Redis Pub/Sub:**
+> ```python
+> import redis.asyncio as aioredis
+>
+> # Publisher side (in notification_service.py)
+> async def publish_to_user(redis_client, user_id: str, notification: dict):
+>     """Publish to Redis channel — all workers subscribed to this channel will receive it."""
+>     await redis_client.publish(f"notifications:{user_id}", json.dumps(notification))
+>
+> # Subscriber side (in notification_event_generator)
+> async def notification_event_generator_redis(user_id: str, request: Request, redis_url: str):
+>     pubsub = aioredis.from_url(redis_url).pubsub()
+>     await pubsub.subscribe(f"notifications:{user_id}")
+>     try:
+>         while not await request.is_disconnected():
+>             message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=30.0)
+>             if message:
+>                 yield f"event: notification\ndata: {message['data']}\n\n"
+>             else:
+>                 yield f"event: heartbeat\ndata: ping\n\n"  # Keep-alive
+>     finally:
+>         await pubsub.unsubscribe(f"notifications:{user_id}")
+>         await pubsub.close()
+> ```
+>
+> Switch the SSE stream endpoint to call `notification_event_generator_redis()` when `settings.REDIS_URL` is set. Keep the in-memory fallback for local dev without Redis.
 
 **Deliverables after Task 4:**
 - ✅ Structured logging with structlog (JSON in prod, pretty in dev)
@@ -1044,8 +1115,13 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
   CMD python -c "import httpx; r = httpx.get('http://localhost:8000/health'); assert r.status_code == 200"
 
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4"]
 ```
+
+> [!IMPORTANT]
+> **Remove `alembic upgrade head` from the CMD.** With `--workers 4`, all 4 workers start simultaneously and each tries to run migrations — a race condition that causes transient failures even though Alembic has locking.
+>
+> **Extract migration as a separate service in `docker-compose.prod.yml`:**
 
 **Docker Compose for production:**
 ```yaml
@@ -1053,6 +1129,19 @@ CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --
 version: '3.8'
 
 services:
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.production
+    container_name: cbt_migrate
+    command: ["sh", "-c", "alembic upgrade head && python -m scripts.seed"]
+    env_file:
+      - ./backend/.env.production
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"  # Run once and exit
+
   backend:
     build:
       context: ./backend
@@ -1064,6 +1153,8 @@ services:
     env_file:
       - ./backend/.env.production
     depends_on:
+      migrate:
+        condition: service_completed_successfully  # Wait for migrate to finish
       redis:
         condition: service_healthy
     deploy:

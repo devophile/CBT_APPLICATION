@@ -394,7 +394,7 @@ flowchart TD
 
 - Email + Password login.
 - Forgot Password → OTP to registered email → Set new password.
-- Profile → Change Password → OTP email verification required.
+- Profile → **Change Password → 2-step OTP flow:** Step 1: Send OTP to registered email → Step 2: Enter OTP + new password. No current-password required.
 
 ```mermaid
 flowchart TD
@@ -763,7 +763,8 @@ flowchart TD
 | qn_bn | Text | Bengali question (bilingual only) |
 | op_bn_1..4 | Text | Bengali options (bilingual only) |
 | correct_option | String | |
-| image_url | String | Cloudinary URL |
+| image_url | String | Cloudinary URL (Phase 2) |
+| image_public_id | String | Cloudinary public_id for cleanup on delete/replace (Phase 2) |
 | solution | Text | |
 
 ### Batch
@@ -813,8 +814,10 @@ flowchart TD
 | time_taken_seconds | Integer | Actual time spent by student (in seconds) |
 | coin_deducted | Decimal | Coins deducted for this attempt |
 | cost_per_question_snapshot | Decimal | Per-question rate at time of attempt (for audit purposes) |
+| wallet_deducted_from | Enum | `teacher` or `student` — records which wallet paid |
+| is_submitted | Boolean | `false` while exam is in progress, `true` after submission. An attempt exists from the moment the student starts (coins already deducted). If `false` and `attempted_at + duration + 30min < now`, the attempt is timed-out/incomplete. |
 | attempted_at | Timestamp | When the attempt started |
-| submitted_at | Timestamp | When the attempt was submitted |
+| submitted_at | Timestamp | When the attempt was submitted (null if not submitted) |
 
 ### Violation
 

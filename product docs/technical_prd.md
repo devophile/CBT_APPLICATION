@@ -491,6 +491,7 @@ erDiagram
         text op_bn_4 "nullable - bilingual"
         varchar correct_option "1 | 2 | 3 | 4"
         varchar image_url "nullable - Phase 2"
+        varchar image_public_id "nullable - Phase 2 Cloudinary cleanup"
         text solution "nullable"
     }
 
@@ -947,6 +948,9 @@ class Question(Base, UUIDMixin):
 
     correct_option: Mapped[str] = mapped_column(String(1))  # "1", "2", "3", or "4"
     image_url: Mapped[Optional[str]] = mapped_column(String(500))
+    # image_public_id: stored in Phase 1 so Phase 2 can delete orphaned Cloudinary images
+    # without needing a new migration (satisfies the "zero migrations" Phase 2 guarantee)
+    image_public_id: Mapped[Optional[str]] = mapped_column(String(500))
     solution: Mapped[Optional[str]] = mapped_column(Text)
 
     exam: Mapped["Exam"] = relationship(back_populates="questions")
@@ -1015,6 +1019,18 @@ class TeacherStudent(Base, UUIDMixin):
 
     __table_args__ = (
         UniqueConstraint("teacher_id", "invited_email", name="uq_teacher_invited_email"),
+        # Prevent duplicate (teacher_id, student_id) pairs after a student registers.
+        # The partial unique constraint only applies to non-null student_id rows.
+        # Using a conditional unique index at DB level handles this cleanly.
+        # For SQLAlchemy, we add it here and rely on the migration to create it:
+        # CREATE UNIQUE INDEX uq_teacher_student ON teacher_students(teacher_id, student_id)
+        #     WHERE student_id IS NOT NULL;
+        Index(
+            "uq_teacher_student",
+            "teacher_id", "student_id",
+            unique=True,
+            postgresql_where="student_id IS NOT NULL",  # Partial index: nulls allowed
+        ),
         Index("ix_teacher_students_invited_email", "invited_email"),
     )
 
@@ -1304,9 +1320,16 @@ class PaginationParams(BaseModel):
 | `POST` | `/auth/verify-otp` | `{ email, code, purpose }` | ❌ | Verify OTP |
 | `POST` | `/auth/forgot-password` | `{ email, role }` | ❌ | Send OTP for password reset |
 | `POST` | `/auth/reset-password` | `{ email, code, new_password }` | ❌ | Reset password after OTP |
-| `POST` | `/auth/change-password` | `{ current_password, new_password }` | ✅ | Change password (logged-in) |
+| `POST` | `/auth/change-password/initiate` | `{ }` | ✅ | Step 1: Send OTP to logged-in user's email (for change-password flow) |
+| `POST` | `/auth/change-password/confirm` | `{ code, new_password }` | ✅ | Step 2: Verify OTP + set new password |
 | `POST` | `/auth/refresh-token` | `{ refresh_token }` | ❌ | Get new access token |
 | `POST` | `/auth/logout` | `{}` | ✅ | Invalidate session |
+
+> [!IMPORTANT]
+> **Change-password is a 2-step OTP flow** (not single-step with `current_password`).
+> This is the authoritative decision — it aligns with `product_feature.md § 5.1` which states OTP verification is required. The `change_password` purpose value in the `Otp` model is actively used.
+> 1. `POST /auth/change-password/initiate` — authenticated, sends OTP to user's email, purpose=`"change_password"`
+> 2. `POST /auth/change-password/confirm` — authenticated, verifies OTP, sets new password
 
 **Pydantic schemas:**
 ```python

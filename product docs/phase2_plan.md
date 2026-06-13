@@ -56,6 +56,7 @@ pip freeze > requirements.txt
 
 ```python
 # app/services/storage_service.py
+import asyncio
 from abc import ABC, abstractmethod
 from typing import Optional, Tuple
 import cloudinary
@@ -83,7 +84,11 @@ class CloudinaryStorageService(IStorageService):
         )
 
     async def upload_image(self, file_bytes: bytes, folder: str = "questions") -> Tuple[str, str]:
-        result = cloudinary.uploader.upload(
+        # ⚠️ cloudinary.uploader.upload() is SYNCHRONOUS.
+        # Calling it directly in an async function blocks the entire event loop.
+        # asyncio.to_thread() runs it in a thread pool without blocking other requests.
+        result = await asyncio.to_thread(
+            cloudinary.uploader.upload,
             file_bytes,
             folder=f"cbt_platform/{folder}",
             resource_type="image",
@@ -95,13 +100,14 @@ class CloudinaryStorageService(IStorageService):
         return result["secure_url"], result["public_id"]
 
     async def delete_image(self, public_id: str) -> bool:
-        result = cloudinary.uploader.destroy(public_id)
+        # Same: destroy() is synchronous — wrap it too
+        result = await asyncio.to_thread(cloudinary.uploader.destroy, public_id)
         return result.get("result") == "ok"
 
 
 # Factory — swap to S3StorageService or OracleStorageService later
 def get_storage_service() -> IStorageService:
-    provider = getattr(settings, "STORAGE_PROVIDER", "cloudinary")
+    provider = settings.STORAGE_PROVIDER  # Always use settings, never getattr() fallback
     if provider == "cloudinary":
         return CloudinaryStorageService()
     # Future: elif provider == "s3": return S3StorageService()
@@ -187,12 +193,32 @@ class QuestionRequest(BaseModel):
 ```
 
 ```python
-# In exam_service.py — enforce Bengali fields for bilingual exams
+# In exam_service.py — enforce Bengali fields when adding a question
 async def add_question(exam_id, data, db):
     exam = await db.get(Exam, exam_id)
     if exam.language == ExamLanguage.bilingual:
         if not all([data.qn_bn, data.op_bn_1, data.op_bn_2, data.op_bn_3, data.op_bn_4]):
             raise ApiError(400, "Bengali fields required for bilingual exams")
+    ...
+
+
+# In exam_service.py — enforce when SWITCHING an existing exam single → bilingual
+async def update_exam(exam_id, data, teacher_id, db):
+    exam = await db.get(Exam, exam_id)
+    # ⚠️ CRITICAL: Validate ALL existing questions before allowing the switch
+    if data.language == ExamLanguage.bilingual and exam.language != ExamLanguage.bilingual:
+        questions = await db.execute(select(Question).where(Question.exam_id == exam_id))
+        questions = questions.scalars().all()
+        incomplete = [
+            q.id for q in questions
+            if not all([q.qn_bn, q.op_bn_1, q.op_bn_2, q.op_bn_3, q.op_bn_4])
+        ]
+        if incomplete:
+            raise ApiError(
+                400,
+                f"{len(incomplete)} question(s) are missing Bengali content. "
+                "Fill in all Bengali fields before switching to bilingual."
+            )
     ...
 ```
 
@@ -214,10 +240,16 @@ async def add_question(exam_id, data, db):
 )}
 ```
 
-**Add Bengali font support in `index.css`:**
-```css
-@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Bengali:wght@400;500;600;700&display=swap');
+**Add Bengali font support in `index.html`:**
+```html
+<!-- In public/index.html <head> — preconnect for faster load, avoids render-blocking CSS @import -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+Bengali:wght@400;500;600;700&display=swap">
 ```
+
+> [!WARNING]
+> Do NOT use `@import url(...)` in CSS files for Bengali fonts. CSS `@import` is render-blocking — it delays page paint. During a timed exam, a flash of unstyled Bengali text is unacceptable. Use `<link>` in `index.html` instead.
 
 **Deliverables after Task 2:**
 - ✅ Teachers can enter Bengali content for bilingual exams
@@ -381,7 +413,25 @@ async def get_revenue_analytics(date_from, date_to, db: AsyncSession):
 - ✅ Per-exam analytics (score distribution, top performers, avg time)
 - ✅ Student performance growth graph (% over time)
 - ✅ Admin revenue dashboard (total, by type)
-- ✅ All charts render with Recharts
+- ✅ All charts render with Recharts (lazy-loaded — see below)
+
+> [!IMPORTANT]
+> **Register the analytics router in `app/api/router.py`:**
+> ```python
+> # app/api/router.py — Phase 2 addition
+> from app.api import analytics
+> api_router.include_router(analytics.router)  # prefix defined in analytics.py
+> ```
+> Without this, all analytics endpoints return 404 regardless of correct implementation.
+
+> [!TIP]
+> **Lazy-load analytics pages** to avoid bloating the student bundle with Recharts (~500KB):
+> ```jsx
+> // In router setup
+> const ExamAnalytics = lazy(() => import('./pages/teacher/ExamAnalytics'));
+> const RevenueAnalytics = lazy(() => import('./pages/admin/RevenueAnalytics'));
+> ```
+> Students and teachers who never visit analytics pages should not download the Recharts library.
 
 ---
 
@@ -402,20 +452,27 @@ async def get_revenue_analytics(date_from, date_to, db: AsyncSession):
 
 **Notification triggers:**
 
-| Event | Notify | Email? |
-|---|---|---|
-| Private exam — teacher wallet insufficient | Teacher | ✅ |
-| Admin credits coins | Recipient | ❌ |
-| Teacher gifts coins to student | Student | ❌ |
+| Event | Notify | Email? | Where to implement |
+|---|---|---|---|
+| Private exam — teacher wallet insufficient | Teacher | ✅ | `exam_service.start_exam()` (Phase 1 stub, Phase 2 wires email) |
+| Admin credits coins | Recipient | ❌ | `admin_service.credit_wallet()` — **must call `create_notification()`** |
+| Teacher gifts coins to student | Student | ❌ | `teacher_service.gift_coins()` — **must call `create_notification()`** |
+
+> [!IMPORTANT]
+> The two ❌-email events (admin credit, teacher gift) are listed in the triggers table but **not yet wired** in the service files. Phase 2 must add `await notification_service.create_notification(user_id=recipient_id, ...)` calls inside `admin_service.credit_wallet()` and `teacher_service.gift_coins()` respectively.
 
 **Notification endpoints:**
 
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/notifications` | Get notifications (paginated) |
-| `GET` | `/notifications/unread-count` | Unread count |
-| `PATCH` | `/notifications/{id}/read` | Mark read |
-| `PATCH` | `/notifications/read-all` | Mark all read |
+> [!NOTE]
+> Use a shared `/notifications` prefix (no role prefix). The notifications table stores `user_id` so each user only sees their own.
+> This resolves the mismatch between Phase 2's `/notifications` prefix and `technical_prd.md § 5.4`'s `/student/notifications` prefix — a shared prefix is correct because teachers and admins also receive notifications.
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `GET` | `/notifications` | Any authenticated user | Get notifications (paginated) |
+| `GET` | `/notifications/unread-count` | Any authenticated user | Unread count |
+| `PATCH` | `/notifications/{id}/read` | Any authenticated user | Mark read |
+| `PATCH` | `/notifications/read-all` | Any authenticated user | Mark all read |
 
 **Email service update:**
 ```python
@@ -500,6 +557,13 @@ async def export_exam_csv(
     from io import StringIO
     from fastapi.responses import StreamingResponse
 
+    # ✅ OWNERSHIP CHECK — any teacher can guess a UUID; this prevents data leaks
+    exam = await db.get(Exam, exam_id)
+    if not exam or exam.teacher_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You do not own this exam")
+
+    # ✅ get_exam_attempts() is a dedicated helper — NOT get_exam_analytics()
+    # It returns the raw attempt list from analytics_service
     attempts = await analytics_service.get_exam_attempts(exam_id, current_user.id, db)
 
     output = StringIO()
@@ -521,6 +585,16 @@ async def export_exam_csv(
         headers={"Content-Disposition": f"attachment; filename=exam_results_{exam_id}.csv"},
     )
 ```
+
+> [!IMPORTANT]
+> **Add `get_exam_attempts()` to `analytics_service.py`** — the CSV export calls this function but it was never defined:
+> ```python
+> async def get_exam_attempts(exam_id: uuid.UUID, teacher_id: uuid.UUID, db: AsyncSession) -> list:
+>     """Return raw attempt list for CSV export — teacher must own the exam."""
+>     result = await get_exam_analytics(exam_id, teacher_id, db)
+>     return result.get("attempts", [])  # Reuse the attempts list from analytics
+> ```
+> Without this, the CSV endpoint raises `AttributeError: module has no attribute 'get_exam_attempts'` at runtime.
 
 #### 5.3 Final Polish
 

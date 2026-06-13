@@ -216,11 +216,14 @@ class Settings(BaseSettings):
     ENV: str = "development"
     PORT: int = 8000
     DATABASE_URL: str
-    DATABASE_URL_SYNC: str = ""
+    DATABASE_URL_SYNC: str = ""  # For Alembic sync operations
     JWT_ACCESS_SECRET: str
     JWT_REFRESH_SECRET: str
     ADMIN_EMAIL: str
     ADMIN_PASSWORD: str
+    # ─── Admin Sentinel UUID (no DB record for admin) ───
+    # Used as created_by in Transaction records for admin-issued credits
+    ADMIN_SENTINEL_UUID: str = "00000000-0000-0000-0000-000000000000"
     SMTP_HOST: str = "smtp.gmail.com"
     SMTP_PORT: int = 587
     SMTP_USER: str = ""
@@ -228,6 +231,15 @@ class Settings(BaseSettings):
     SMTP_FROM: str = ""
     SMTP_FROM_NAME: str = "Devophile CBT"
     FRONTEND_URL: str = "http://localhost:5173"
+    # ─── Cloudinary (Phase 2) — defined here to avoid AttributeError on import ───
+    CLOUDINARY_CLOUD_NAME: str = ""
+    CLOUDINARY_API_KEY: str = ""
+    CLOUDINARY_API_SECRET: str = ""
+    STORAGE_PROVIDER: str = "cloudinary"  # swap to "s3" or "oracle" in Phase 3
+    # ─── Redis (Phase 3) ───
+    REDIS_URL: str = ""
+    # ─── Sentry (Phase 3) ───
+    SENTRY_DSN: str = ""
 
     class Config:
         env_file = ".env"
@@ -317,14 +329,22 @@ def paginated_response(
 **Key `auth_service.py` behaviors:**
 
 ```python
+ADMIN_SENTINEL_UUID = "00000000-0000-0000-0000-000000000000"  # Fixed UUID for admin audit trail
+
 async def admin_login(email: str, password: str) -> dict:
-    """Validate against env vars — no DB lookup."""
+    """Validate against env vars — no DB lookup.
+
+    Admin has no DB record, so we use a fixed sentinel UUID as the `sub`
+    in the JWT payload. This allows `created_by` in Transaction records
+    to store a valid UUID without a RuntimeError.
+    """
     if email != settings.ADMIN_EMAIL or password != settings.ADMIN_PASSWORD:
         raise ApiError(401, "Invalid credentials")
     session_id = str(uuid.uuid4())
-    access_token = create_access_token("admin", email, "super_admin", session_id)
-    refresh_token = create_refresh_token("admin")
-    return {"user": {"id": "admin", "email": email, "name": "Admin", "role": "super_admin"},
+    # Use sentinel UUID so credit_wallet's created_by=uuid.UUID(admin_id) never crashes
+    access_token = create_access_token(ADMIN_SENTINEL_UUID, email, "super_admin", session_id)
+    refresh_token = create_refresh_token(ADMIN_SENTINEL_UUID)
+    return {"user": {"id": ADMIN_SENTINEL_UUID, "email": email, "name": "Admin", "role": "super_admin"},
             "tokens": {"access_token": access_token, "refresh_token": refresh_token}}
 
 
@@ -540,7 +560,12 @@ async def credit_wallet(
     user_id: uuid.UUID, amount: Decimal, credit_type: CreditType,
     description: str, admin_id: str, db: AsyncSession
 ) -> dict:
-    """Credit coins to any user's wallet (atomic)."""
+    """Credit coins to any user's wallet (atomic).
+
+    admin_id is the JWT `sub` claim. For the Super Admin it is the sentinel
+    UUID "00000000-0000-0000-0000-000000000000" (no real DB record).
+    uuid.UUID() handles this safely since it is a valid UUID string.
+    """
     wallet = await db.execute(
         select(Wallet).where(Wallet.user_id == user_id).with_for_update()
     )
@@ -551,12 +576,14 @@ async def credit_wallet(
     new_balance = wallet.balance + amount
     wallet.balance = new_balance
 
+    # admin_id is always a valid UUID string (sentinel or teacher UUID)
+    # uuid.UUID(admin_id) is safe because admin_login() now uses ADMIN_SENTINEL_UUID
     db.add(Transaction(
         wallet_id=wallet.id, user_id=user_id,
         transaction_type=TransactionType.credit, credit_type=credit_type,
         amount=amount, reason=TransactionReason.admin_credit,
         description=description, balance_after=new_balance,
-        created_by=uuid.UUID(admin_id),  # Audit: which admin issued this credit
+        created_by=uuid.UUID(admin_id),  # Audit: sentinel UUID for Super Admin
     ))
 
     return success_response({"balance": float(new_balance)}, "Coins credited")
@@ -609,9 +636,13 @@ Same as [technical_prd.md](./technical_prd.md) § 3 — AdminLayout, AdminDashbo
 - ✅ Admin can view/search/filter all teachers and students
 - ✅ Admin can activate/deactivate/soft-delete teachers and students
 - ✅ Admin can credit Devo-coins (paid/gift) to any user
+- ✅ Admin can **reset teacher password** (`PATCH /admin/teachers/{id}/reset-password` with `{ new_password }`) — overrides any password the teacher set
 - ✅ Admin can set per-question cost and publishing fee
 - ✅ Admin can view all platform transactions
 - ✅ All admin endpoints visible in Swagger at `/docs`
+
+> [!IMPORTANT]
+> `admin_service.reset_teacher_password(teacher_id, new_password, db)` must hash the new password with `hash_password()` before saving. This is a required Phase 1 endpoint per `product_feature.md § Appendix` and `technical_prd.md § 5.2`.
 
 ---
 
@@ -697,7 +728,9 @@ async def add_question(
         op_en_3=data.op_en_3, op_en_4=data.op_en_4,
         qn_bn=data.qn_bn, op_bn_1=data.op_bn_1, op_bn_2=data.op_bn_2,
         op_bn_3=data.op_bn_3, op_bn_4=data.op_bn_4,
-        correct_option=data.correct_option, image_url=data.image_url,
+        correct_option=data.correct_option,
+        image_url=data.image_url,
+        image_public_id=data.image_public_id,  # Phase 2 Cloudinary cleanup — stored in Phase 1 schema
         solution=data.solution,
     )
     db.add(question)
@@ -816,12 +849,15 @@ Same as [technical_prd.md](./technical_prd.md) — StudentLayout, StudentHome (c
 | Edge Case | Implementation |
 |---|---|
 | Teacher adds unregistered email → student registers later | On registration, query `teacher_students` by `invited_email` → flip to active |
-| Teacher soft-deleted → exams hidden | Create shared `get_active_exams_query()` in `exam_service.py` that auto-applies `is_deleted == False` + teacher soft-delete join filter. All student-facing endpoints must use this query builder. |
+| Teacher soft-deleted → exams hidden | `get_active_exams_query()` in `exam_service.py` must JOIN `users` table: `.join(User, Exam.teacher_id == User.id).where(Exam.is_deleted == False, User.is_deleted == False)`. Use this shared query builder for ALL student-facing exam endpoints. |
 | Student inactive → blocked from everything | `get_current_user` dependency checks `is_active` on every request |
-| Mid-exam browser close | Client-side only — answers lost, attempt stays `is_submitted=False` |
-| Race condition: concurrent exam start | `UniqueConstraint("exam_id", "student_id")` + `with_for_update()` row lock on Exam row (serializes concurrent requests). Wrap `db.flush()` in `try/except IntegrityError` → return `409 Conflict` as defense-in-depth. |
+| Mid-exam browser close — abandoned attempt | Attempt stays `is_submitted=False`. On `GET /student/exams/{id}`, if an `is_submitted=False` attempt exists and `attempted_at + duration_minutes + 30 min buffer < now`, treat it as timed-out/incomplete. Show a "Exam timed out" result page. The student cannot re-attempt (coins already deducted per product policy). |
+| Race condition: concurrent exam start | `UniqueConstraint("exam_id", "student_id")` + `with_for_update()` row lock on Wallet row only. Wrap `db.flush()` in `try/except IntegrityError` → return `409 Conflict` as defense-in-depth. |
 | Negative wallet balance prevention | Wallet check inside same transaction as deduction |
 | Negative marks entered as negative number | Pydantic schema enforces `positive_marks > 0` and `negative_marks >= 0` (use `ge=0`) to prevent score formula inversion |
+| Exam time-window not enforced | In `start_exam`, after checking `exam.is_active`, validate the current server time is within `[scheduled_date + start_time, scheduled_date + end_time]`. Use `datetime.combine(exam.scheduled_date, datetime.strptime(exam.start_time, "%H:%M").time())`. Return `400 "Exam has not started yet"` or `400 "Exam window has passed"` accordingly. |
+| Section deleted on locked exam | `DELETE /teacher/exams/{exam_id}/sections/{id}` must check `exam.is_locked`. If `True`, return `403 "Cannot delete sections after the exam has been attempted"`. This prevents bypassing question lock via cascade delete. |
+| Focused zone / exam validation | `focused_zones` (teacher) and `focused_exam` (student) must be validated against an allowed list. Add `ExamCategory` enum: `NEET, JEE, SSC, UPSC, Banking`. Use `Literal` in Pydantic schemas. |
 
 #### 5.2 Shared UI Components
 
@@ -847,37 +883,75 @@ src/components/ui/
 
 ```python
 # tests/conftest.py
+# ⚠️ Uses isolated test engine with per-test rollback for data isolation.
+# Do NOT use the production async_session_factory here.
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from app.main import app
-from app.core.database import engine, async_session_factory
+from app.core.database import get_db
+from app.core.config import settings
 
-@pytest_asyncio.fixture
-async def client():
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        yield ac
+# Separate test engine — points to TEST database (set via env in CI)
+test_engine = create_async_engine(settings.DATABASE_URL, echo=False)
+TestSessionLocal = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
 
 @pytest_asyncio.fixture
 async def db_session():
-    async with async_session_factory() as session:
+    """Yields a session that rolls back after each test — no data pollution."""
+    async with TestSessionLocal() as session:
         yield session
+        await session.rollback()  # ← KEY: undo all test writes
+
+
+@pytest_asyncio.fixture
+async def client(db_session):
+    """Override get_db to use the isolated test session."""
+    async def override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_get_db
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+    app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def admin_headers(client):
+    """Auth headers for Super Admin — uses env vars, not hardcoded strings."""
+    response = await client.post("/api/v1/auth/admin/login", json={
+        "email": settings.ADMIN_EMAIL,
+        "password": settings.ADMIN_PASSWORD,
+    })
+    token = response.json()["data"]["tokens"]["access_token"]
+    return {"Authorization": f"Bearer {token}"}
 ```
 
 ```python
 # tests/integration/test_auth.py
 import pytest
+from app.core.config import settings  # Always use env vars — never hardcode credentials
 
 @pytest.mark.asyncio
 async def test_admin_login_success(client):
     response = await client.post("/api/v1/auth/admin/login", json={
-        "email": "admin@devophile.com",
-        "password": "testpassword"
+        "email": settings.ADMIN_EMAIL,      # From .env — matches CI env vars
+        "password": settings.ADMIN_PASSWORD,
     })
     assert response.status_code == 200
     data = response.json()
     assert "access_token" in data["data"]["tokens"]
+
+@pytest.mark.asyncio
+async def test_admin_login_wrong_password(client):
+    response = await client.post("/api/v1/auth/admin/login", json={
+        "email": settings.ADMIN_EMAIL,
+        "password": "wrong-password-xyz",
+    })
+    assert response.status_code == 401
 
 @pytest.mark.asyncio
 async def test_student_register_and_login(client):
@@ -902,7 +976,10 @@ pytest tests/ -v --tb=short
 **Backend → Render:**
 - New Web Service → Docker → Root directory: `backend`
 - Build command: `pip install -r requirements.txt`
-- Start command: `alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- Start command: `alembic upgrade head && python -m scripts.seed && uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+
+> [!IMPORTANT]
+> `python -m scripts.seed` is **mandatory** — it seeds the `exam_cost_config` table. Without it, `start_exam` crashes with `NoResultFound` because `scalar_one()` expects exactly one row. The seed script is idempotent (skips if row already exists) so it is safe to run on every deploy.
 - Set all environment variables
 
 **Frontend → Vercel:**
