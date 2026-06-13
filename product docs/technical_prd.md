@@ -1214,18 +1214,24 @@ alembic init alembic
 # After editing models:
 alembic revision --autogenerate -m "description_of_change"
 
-# Apply migrations
+# Apply migrations (only runs NEW migrations — checks alembic_version stamp)
 alembic upgrade head
+
+# Check current stamp in DB
+alembic current
+
+# View pending migrations (current vs head)
+alembic heads
 
 # Rollback one step
 alembic downgrade -1
 
-# View current version
-alembic current
-
 # View migration history
 alembic history
 ```
+
+> [!IMPORTANT]
+> **How Alembic stamping works:** Alembic maintains a single-row `alembic_version` table in PostgreSQL that records the current migration revision hash. When `alembic upgrade head` runs, it compares the DB stamp against the latest revision in the `alembic/versions/` directory. If they match, **nothing happens** — no migrations are executed. Only new, unapplied revisions are run. This makes `alembic upgrade head` **idempotent and safe to call on every deploy**.
 
 **`alembic/env.py` (key section):**
 ```python
@@ -1243,35 +1249,174 @@ target_metadata = Base.metadata
 2. `002_init_auth_tables` — otps, refresh_tokens
 3. `003_init_exam_tables` — exam_cost_config, exams, sections, questions
 4. `004_init_batch_tables` — batches, teacher_students, batch_students, exam_batches
-5. `005_init_attempt_tables` — exam_attempts, violations, notifications
+5. `005_init_attempt_tables_and_seed` — exam_attempts, violations, notifications + **seed ExamCostConfig**
 
-**Seed script (`backend/scripts/seed.py`):**
+**Seed data via Alembic data migration (inside `005_init_attempt_tables_and_seed`):**
+
+> [!IMPORTANT]
+> **No separate seed script.** Seed data is embedded in the final Alembic migration as a data migration. This ensures seeding runs **exactly once** (when the migration is first applied) and is tracked by the Alembic version stamp. Re-running `alembic upgrade head` on a stamped DB will skip this entirely.
+
 ```python
-import asyncio
+# alembic/versions/005_init_attempt_tables_and_seed.py
+
+from alembic import op
+import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import UUID
 import uuid
 from decimal import Decimal
-from app.core.database import async_session_factory
-from app.models.exam import ExamCostConfig
+
+revision = "005"
+down_revision = "004"
 
 SEED_CONFIG_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
-async def seed():
+def upgrade():
+    # --- Schema: create tables ---
+    op.create_table(
+        "exam_attempts",
+        # ... (columns defined by autogenerate)
+    )
+    op.create_table("violations", ...)
+    op.create_table("notifications", ...)
+
+    # --- Data: seed ExamCostConfig ---
+    # This runs exactly once when this migration is applied.
+    # Alembic stamps the DB after this — subsequent `alembic upgrade head` calls skip it.
+    exam_cost_config = sa.table(
+        "exam_cost_config",
+        sa.column("id", UUID(as_uuid=True)),
+        sa.column("cost_per_question", sa.Numeric(10, 4)),
+        sa.column("global_exam_publishing_fee", sa.Numeric(10, 4)),
+    )
+    op.execute(
+        exam_cost_config.insert().values(
+            id=SEED_CONFIG_ID,
+            cost_per_question=Decimal("0.15"),
+            global_exam_publishing_fee=Decimal("10"),
+        )
+    )
+    print("✅ Exam cost config seeded (₹0.15/question, 10 coin publishing fee)")
+
+def downgrade():
+    # Remove seed data first, then drop tables
+    op.execute(f"DELETE FROM exam_cost_config WHERE id = '{SEED_CONFIG_ID}'")
+    op.drop_table("notifications")
+    op.drop_table("violations")
+    op.drop_table("exam_attempts")
+```
+
+**Smart startup script (`backend/scripts/startup.py`):**
+
+> Used instead of raw `alembic upgrade head` in Docker CMD. Checks the stamp first.
+
+```python
+# backend/scripts/startup.py
+import asyncio
+import subprocess
+import sys
+import uuid
+
+from app.core.config import settings
+from app.core.security import hash_password
+from app.core.database import async_session_factory
+from app.models.user import User, Role
+from app.models.wallet import Wallet
+from sqlalchemy import select
+from decimal import Decimal
+
+
+def get_current_revision() -> str | None:
+    """Get the current Alembic stamp from the database."""
+    result = subprocess.run(
+        ["alembic", "current"],
+        capture_output=True, text=True
+    )
+    output = result.stdout.strip()
+    if not output or "(head)" not in output:
+        return None
+    return output.split()[0]
+
+
+def get_head_revision() -> str:
+    """Get the latest migration revision from the alembic/versions/ directory."""
+    result = subprocess.run(
+        ["alembic", "heads"],
+        capture_output=True, text=True
+    )
+    return result.stdout.strip().split()[0]
+
+
+def run_migrations():
+    """Check stamp and run migrations only if needed."""
+    current = get_current_revision()
+    head = get_head_revision()
+
+    if current is None:
+        print("🔄 No Alembic stamp found — running all migrations (fresh DB)...")
+        subprocess.run(["alembic", "upgrade", "head"], check=True)
+        print("✅ All migrations applied (including seed data).")
+    elif current != head.replace(" (head)", ""):
+        print(f"🔄 DB at revision {current}, head is {head} — applying new migrations...")
+        subprocess.run(["alembic", "upgrade", "head"], check=True)
+        print("✅ New migrations applied.")
+    else:
+        print(f"✅ DB already at head ({current}). No migrations needed.")
+
+
+async def ensure_admin_user():
+    """
+    Upsert the Super Admin user from .env on EVERY startup.
+
+    - Reads ADMIN_EMAIL and ADMIN_PASSWORD from environment.
+    - If no admin user exists → creates one with role=super_admin + wallet.
+    - If admin user exists → overwrites email and password hash.
+
+    This ensures that if you update .env credentials, the DB record
+    is always in sync after the next restart. The admin gets a real
+    UUID, a real User record, a real Wallet, and single-device
+    session enforcement — identical to teacher/student auth.
+    """
     async with async_session_factory() as session:
-        existing = await session.get(ExamCostConfig, SEED_CONFIG_ID)
-        if not existing:
-            config = ExamCostConfig(
-                id=SEED_CONFIG_ID,
-                cost_per_question=Decimal("0.15"),
-                global_exam_publishing_fee=Decimal("10"),
+        async with session.begin():
+            # Find existing admin user (by role, not email — email can change)
+            result = await session.execute(
+                select(User).where(User.role == Role.super_admin)
             )
-            session.add(config)
-            await session.commit()
-            print("✅ Exam cost config seeded (₹0.15/question, 10 coin publishing fee)")
-        else:
-            print("ℹ️  Exam cost config already exists, skipping seed")
+            admin = result.scalar_one_or_none()
+
+            if admin is None:
+                # First boot — create admin user + wallet
+                admin = User(
+                    email=settings.ADMIN_EMAIL,
+                    password=hash_password(settings.ADMIN_PASSWORD),
+                    name="Super Admin",
+                    phone="",
+                    role=Role.super_admin,
+                    is_active=True,
+                    is_verified=True,
+                )
+                session.add(admin)
+                await session.flush()  # Get admin.id
+
+                wallet = Wallet(
+                    user_id=admin.id,
+                    balance=Decimal("0"),
+                )
+                session.add(wallet)
+                print(f"✅ Super Admin created in DB (email: {settings.ADMIN_EMAIL})")
+            else:
+                # Existing admin — overwrite creds from .env
+                admin.email = settings.ADMIN_EMAIL
+                admin.password = hash_password(settings.ADMIN_PASSWORD)
+                print(f"🔄 Super Admin credentials synced from .env (email: {settings.ADMIN_EMAIL})")
+
 
 if __name__ == "__main__":
-    asyncio.run(seed())
+    # 1. Run pending migrations (stamp-aware)
+    run_migrations()
+
+    # 2. Upsert admin user from .env (runs EVERY startup)
+    asyncio.run(ensure_admin_user())
 ```
 
 ---
@@ -1772,8 +1917,11 @@ async def get_dashboard(
 
 ### 6.3 Super Admin Auth
 
-- Validated against `settings.ADMIN_EMAIL` and `settings.ADMIN_PASSWORD`
-- No DB lookup — JWT issued with `role: "super_admin"` directly
+- Admin credentials are **read from `.env`** (`ADMIN_EMAIL`, `ADMIN_PASSWORD`) and **upserted into the `users` table** on every application startup via `scripts/startup.py`.
+- The admin gets a **real `User` record** with `role: "super_admin"`, a **real UUID**, and a **real `Wallet`**.
+- Admin login does a **standard DB lookup** — identical to teacher/student login (password hash verification, `active_session_id` session management).
+- If `.env` credentials are updated, the next restart **overwrites** the DB record's email and password hash. No manual DB intervention needed.
+- This eliminates the sentinel UUID workaround — admin `created_by` in Transaction records now references a real user ID.
 
 ### 6.4 Session Management (Single Device)
 
@@ -1996,9 +2144,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy app code
 COPY . .
 
-# Run migrations and start server
+# Run smart startup (checks stamp, migrates only if needed) then start server
 EXPOSE 8000
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+CMD ["sh", "-c", "python -m scripts.startup && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
 ```
 
 ### Backend `requirements.txt`

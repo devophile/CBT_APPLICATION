@@ -1134,7 +1134,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile.production
     container_name: cbt_migrate
-    command: ["sh", "-c", "alembic upgrade head && python -m scripts.seed"]
+    command: ["python", "-m", "scripts.startup"]  # Checks stamp, runs only new migrations (seeding is in migration 005)
     env_file:
       - ./backend/.env.production
     depends_on:

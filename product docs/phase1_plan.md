@@ -69,11 +69,11 @@ alembic init alembic
 # 3. Auto-generate migrations from models
 alembic revision --autogenerate -m "init_all_tables"
 
-# 4. Apply migrations
+# 4. Apply migrations (checks alembic_version stamp — only runs NEW revisions)
 alembic upgrade head
 
-# 5. Seed exam cost config
-python -m scripts.seed
+# Seed data is embedded in migration 005_init_attempt_tables_and_seed.
+# It runs exactly once when that migration is applied. No separate seed command needed.
 ```
 
 **Rolling back if needed:**
@@ -329,22 +329,30 @@ def paginated_response(
 **Key `auth_service.py` behaviors:**
 
 ```python
-ADMIN_SENTINEL_UUID = "00000000-0000-0000-0000-000000000000"  # Fixed UUID for admin audit trail
+async def admin_login(email: str, password: str, db: AsyncSession) -> dict:
+    """DB lookup — admin is a real User record seeded from .env on every startup.
 
-async def admin_login(email: str, password: str) -> dict:
-    """Validate against env vars — no DB lookup.
-
-    Admin has no DB record, so we use a fixed sentinel UUID as the `sub`
-    in the JWT payload. This allows `created_by` in Transaction records
-    to store a valid UUID without a RuntimeError.
+    The startup script (scripts/startup.py) upserts the admin user from
+    ADMIN_EMAIL / ADMIN_PASSWORD env vars on every boot. If .env changes,
+    the DB record is updated on next restart.
     """
-    if email != settings.ADMIN_EMAIL or password != settings.ADMIN_PASSWORD:
+    user = await db.execute(
+        select(User).where(User.email == email, User.role == Role.super_admin, User.is_deleted == False)
+    )
+    user = user.scalar_one_or_none()
+    if not user:
         raise ApiError(401, "Invalid credentials")
+    if not verify_password(password, user.password):
+        raise ApiError(401, "Invalid credentials")
+
+    # Single device — overwrite session (same as teacher/student)
     session_id = str(uuid.uuid4())
-    # Use sentinel UUID so credit_wallet's created_by=uuid.UUID(admin_id) never crashes
-    access_token = create_access_token(ADMIN_SENTINEL_UUID, email, "super_admin", session_id)
-    refresh_token = create_refresh_token(ADMIN_SENTINEL_UUID)
-    return {"user": {"id": ADMIN_SENTINEL_UUID, "email": email, "name": "Admin", "role": "super_admin"},
+    user.active_session_id = session_id
+    await db.flush()
+
+    access_token = create_access_token(str(user.id), user.email, "super_admin", session_id)
+    refresh_token = create_refresh_token(str(user.id))
+    return {"user": {"id": str(user.id), "email": user.email, "name": user.name, "role": "super_admin"},
             "tokens": {"access_token": access_token, "refresh_token": refresh_token}}
 
 
@@ -456,8 +464,8 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
 @router.post("/admin/login")
-async def admin_login(body: LoginRequest):
-    return await auth_service.admin_login(body.email, body.password)
+async def admin_login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
+    return await auth_service.admin_login(body.email, body.password, db)
 
 
 @router.post("/teacher/login")
@@ -576,14 +584,13 @@ async def credit_wallet(
     new_balance = wallet.balance + amount
     wallet.balance = new_balance
 
-    # admin_id is always a valid UUID string (sentinel or teacher UUID)
-    # uuid.UUID(admin_id) is safe because admin_login() now uses ADMIN_SENTINEL_UUID
+    # admin_id is the JWT `sub` claim — a real UUID from the admin's User record
     db.add(Transaction(
         wallet_id=wallet.id, user_id=user_id,
         transaction_type=TransactionType.credit, credit_type=credit_type,
         amount=amount, reason=TransactionReason.admin_credit,
         description=description, balance_after=new_balance,
-        created_by=uuid.UUID(admin_id),  # Audit: sentinel UUID for Super Admin
+        created_by=uuid.UUID(admin_id),  # Audit: real admin UUID from DB
     ))
 
     return success_response({"balance": float(new_balance)}, "Coins credited")
@@ -976,10 +983,10 @@ pytest tests/ -v --tb=short
 **Backend → Render:**
 - New Web Service → Docker → Root directory: `backend`
 - Build command: `pip install -r requirements.txt`
-- Start command: `alembic upgrade head && python -m scripts.seed && uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- Start command: `python -m scripts.startup && uvicorn app.main:app --host 0.0.0.0 --port $PORT`
 
 > [!IMPORTANT]
-> `python -m scripts.seed` is **mandatory** — it seeds the `exam_cost_config` table. Without it, `start_exam` crashes with `NoResultFound` because `scalar_one()` expects exactly one row. The seed script is idempotent (skips if row already exists) so it is safe to run on every deploy.
+> **No separate seed command needed.** Seed data (ExamCostConfig) is embedded in Alembic migration `005_init_attempt_tables_and_seed`. It runs exactly once when the migration is first applied, tracked by the Alembic `alembic_version` stamp. The `scripts/startup.py` script checks the current DB stamp against head — if they match, no migrations run. Only new, unapplied revisions are executed. This is safe for every deploy.
 - Set all environment variables
 
 **Frontend → Vercel:**
