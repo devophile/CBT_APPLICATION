@@ -223,6 +223,61 @@ Index("ix_attempts_exam_submitted", "exam_id", "is_submitted"),
 # app/models/wallet.py — add to Transaction __table_args__
 Index("ix_transactions_wallet_created", "wallet_id", "created_at"),
 Index("ix_transactions_reason_created", "reason", "created_at"),
+
+# app/models/user.py — trigram GIN index for email search (eliminates full table scans)
+# Requires: CREATE EXTENSION IF NOT EXISTS pg_trgm;
+Index("ix_users_email_trgm", User.email,
+      postgresql_using="gin", postgresql_ops={"email": "gin_trgm_ops"})
+```
+
+> [!IMPORTANT]
+> **Trigram index migration:** The `pg_trgm` extension must be enabled BEFORE the GIN index can be created. Add this to the Alembic migration:
+> ```python
+> def upgrade():
+>     op.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+>     # Then create the index
+> ```
+> After this, `User.email.ilike(f"%{search}%")` will use the GIN index instead of a sequential scan — critical once the user base exceeds ~10K rows.
+
+**Wallet balance reconciliation script (`backend/scripts/reconcile_wallets.py`):**
+
+> Run as a periodic health check (weekly cron or manual). Detects if `Wallet.balance` has drifted from `SUM(Transaction.amount)` due to lock failures or bugs.
+
+```python
+# backend/scripts/reconcile_wallets.py
+import asyncio
+from app.core.database import async_session_factory
+from sqlalchemy import text
+
+RECONCILIATION_QUERY = """
+    SELECT w.id, w.user_id, w.balance AS wallet_balance,
+           COALESCE(SUM(
+               CASE WHEN t.transaction_type = 'credit' THEN t.amount
+                    ELSE -t.amount END
+           ), 0) AS computed_balance
+    FROM wallets w
+    LEFT JOIN transactions t ON w.id = t.wallet_id
+    GROUP BY w.id
+    HAVING w.balance != COALESCE(SUM(
+        CASE WHEN t.transaction_type = 'credit' THEN t.amount
+             ELSE -t.amount END
+    ), 0);
+"""
+
+async def reconcile():
+    async with async_session_factory() as session:
+        result = await session.execute(text(RECONCILIATION_QUERY))
+        mismatches = result.all()
+        if not mismatches:
+            print("✅ All wallet balances are consistent.")
+        else:
+            print(f"⚠️  Found {len(mismatches)} balance mismatches:")
+            for row in mismatches:
+                print(f"   Wallet {row.id} (user {row.user_id}): "
+                      f"stored={row.wallet_balance}, computed={row.computed_balance}")
+
+if __name__ == "__main__":
+    asyncio.run(reconcile())
 ```
 
 **Connection pooling optimization:**

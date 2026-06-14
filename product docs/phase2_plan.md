@@ -292,8 +292,14 @@ npm install recharts date-fns
 ```python
 # app/services/analytics_service.py
 
-async def get_exam_analytics(exam_id: uuid.UUID, teacher_id: uuid.UUID, db: AsyncSession):
-    """Per-exam: total attempts, avg score, distribution, top performers."""
+async def get_exam_analytics(exam_id: uuid.UUID, teacher_id: uuid.UUID, db: AsyncSession, page: int = 1, page_size: int = 50):
+    """Per-exam: total attempts, avg score, distribution, top performers.
+    
+    🔥 OPTIMIZATION: All aggregations are pushed down to PostgreSQL.
+    The old version loaded ALL attempts into Python memory to calculate
+    avg/max/min — OOM risk for global exams with 50K+ attempts.
+    Now: 4 lightweight queries, O(1) memory for stats.
+    """
     # Verify exam belongs to teacher
     exam = await db.execute(
         select(Exam).where(Exam.id == exam_id, Exam.teacher_id == teacher_id)
@@ -302,50 +308,93 @@ async def get_exam_analytics(exam_id: uuid.UUID, teacher_id: uuid.UUID, db: Asyn
     if not exam:
         raise NotFoundError("Exam")
 
-    # Get all submitted attempts with student names
-    attempts = await db.execute(
-        select(ExamAttempt, User.name, User.email)
+    # --- Query 1: DB-level aggregation (returns 1 row, not 50K) ---
+    stats = await db.execute(
+        select(
+            func.count(ExamAttempt.id).label("total_attempts"),
+            func.avg(ExamAttempt.score).label("avg_score"),
+            func.max(ExamAttempt.score).label("max_score"),
+            func.min(ExamAttempt.score).label("min_score"),
+            func.max(ExamAttempt.total_marks).label("total_marks"),
+            func.avg(ExamAttempt.time_taken_seconds).label("avg_time"),
+        )
+        .where(ExamAttempt.exam_id == exam_id, ExamAttempt.is_submitted == True)
+    )
+    stats = stats.one()
+
+    if stats.total_attempts == 0:
+        return {"exam_name": exam.name, "total_attempts": 0}
+
+    total_marks = float(stats.total_marks or 0)
+
+    # --- Query 2: Score distribution via CASE buckets (returns 5 rows, not 50K) ---
+    bucket_size = total_marks / 5 if total_marks > 0 else 1
+    distribution = await db.execute(
+        select(
+            case(
+                (ExamAttempt.score < bucket_size, "0-20%"),
+                (ExamAttempt.score < bucket_size * 2, "20-40%"),
+                (ExamAttempt.score < bucket_size * 3, "40-60%"),
+                (ExamAttempt.score < bucket_size * 4, "60-80%"),
+                else_="80-100%",
+            ).label("bucket"),
+            func.count(ExamAttempt.id).label("count"),
+        )
+        .where(ExamAttempt.exam_id == exam_id, ExamAttempt.is_submitted == True)
+        .group_by("bucket")
+    )
+    score_distribution = {row.bucket: row.count for row in distribution.all()}
+
+    # --- Query 3: Top 5 performers only (LIMIT 5) ---
+    top = await db.execute(
+        select(ExamAttempt.score, ExamAttempt.time_taken_seconds, User.name)
         .join(User, ExamAttempt.student_id == User.id)
         .where(ExamAttempt.exam_id == exam_id, ExamAttempt.is_submitted == True)
         .order_by(ExamAttempt.score.desc())
+        .limit(5)
     )
-    attempts = attempts.all()
 
-    if not attempts:
-        return {"exam_name": exam.name, "total_attempts": 0}
-
-    scores = [float(a[0].score) for a in attempts]
-    total_marks = float(attempts[0][0].total_marks) if attempts else 0
-
-    # Score distribution (buckets)
-    distribution = build_score_distribution(scores, total_marks)
-
-    # Violation count
+    # --- Query 4: Violation count ---
     violation_count = await db.execute(
         select(func.count(Violation.id))
         .join(ExamAttempt, Violation.attempt_id == ExamAttempt.id)
         .where(ExamAttempt.exam_id == exam_id)
     )
 
+    # --- Query 5: Paginated attempt list for data grid ---
+    offset = (page - 1) * page_size
+    attempt_rows = await db.execute(
+        select(
+            ExamAttempt.score, ExamAttempt.time_taken_seconds,
+            ExamAttempt.submitted_at, User.name, User.email
+        )
+        .join(User, ExamAttempt.student_id == User.id)
+        .where(ExamAttempt.exam_id == exam_id, ExamAttempt.is_submitted == True)
+        .order_by(ExamAttempt.score.desc())
+        .offset(offset).limit(page_size)
+    )
+
     return {
         "exam_name": exam.name,
-        "total_attempts": len(attempts),
-        "avg_score": round(sum(scores) / len(scores), 2),
-        "max_score": max(scores, default=0),
-        "min_score": min(scores, default=0),
+        "total_attempts": stats.total_attempts,
+        "avg_score": round(float(stats.avg_score), 2),
+        "max_score": float(stats.max_score),
+        "min_score": float(stats.min_score),
         "total_possible_marks": total_marks,
-        "score_distribution": distribution,
-        "avg_time_taken": round(sum(a[0].time_taken_seconds or 0 for a in attempts) / len(attempts) / 60, 1),
+        "score_distribution": score_distribution,
+        "avg_time_taken": round(float(stats.avg_time or 0) / 60, 1),
         "violation_count": violation_count.scalar(),
         "top_performers": [
-            {"name": a[1], "score": float(a[0].score), "time_taken": a[0].time_taken_seconds}
-            for a in attempts[:5]
+            {"name": r.name, "score": float(r.score), "time_taken": r.time_taken_seconds}
+            for r in top.all()
         ],
         "attempts": [
-            {"student_name": a[1], "email": a[2], "score": float(a[0].score),
-             "time_taken": a[0].time_taken_seconds, "submitted_at": a[0].submitted_at.isoformat()}
-            for a in attempts
+            {"student_name": r.name, "email": r.email, "score": float(r.score),
+             "time_taken": r.time_taken_seconds, "submitted_at": r.submitted_at.isoformat()}
+            for r in attempt_rows.all()
         ],
+        "page": page,
+        "page_size": page_size,
     }
 
 

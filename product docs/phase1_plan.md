@@ -741,6 +741,7 @@ async def add_question(
         solution=data.solution,
     )
     db.add(question)
+    exam.question_count += 1  # Maintain denormalized count for cost display on listings
     await db.flush()
     return success_response(QuestionResponse.from_orm(question), "Question added")
 ```
@@ -864,6 +865,7 @@ Same as [technical_prd.md](./technical_prd.md) — StudentLayout, StudentHome (c
 | Negative marks entered as negative number | Pydantic schema enforces `positive_marks > 0` and `negative_marks >= 0` (use `ge=0`) to prevent score formula inversion |
 | Exam time-window not enforced | In `start_exam`, after checking `exam.is_active`, validate the current server time is within `[scheduled_date + start_time, scheduled_date + end_time]`. Use `datetime.combine(exam.scheduled_date, datetime.strptime(exam.start_time, "%H:%M").time())`. Return `400 "Exam has not started yet"` or `400 "Exam window has passed"` accordingly. |
 | Section deleted on locked exam | `DELETE /teacher/exams/{exam_id}/sections/{id}` must check `exam.is_locked`. If `True`, return `403 "Cannot delete sections after the exam has been attempted"`. This prevents bypassing question lock via cascade delete. |
+| Question delete/section cascade → stale `question_count` | On `DELETE /teacher/exams/{exam_id}/questions/{id}`: decrement `exam.question_count -= 1`. On section delete (cascade), recalculate: `exam.question_count = await db.scalar(select(func.count(Question.id)).where(Question.exam_id == exam_id))`. |
 | Focused zone / exam validation | `focused_zones` (teacher) and `focused_exam` (student) must be validated against an allowed list. Add `ExamCategory` enum: `NEET, JEE, SSC, UPSC, Banking`. Use `Literal` in Pydantic schemas. |
 
 #### 5.2 Shared UI Components

@@ -888,6 +888,7 @@ class Exam(Base, UUIDMixin, TimestampMixin):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
     is_locked: Mapped[bool] = mapped_column(Boolean, default=False)
+    question_count: Mapped[int] = mapped_column(Integer, default=0)  # Denormalized — maintained by add/delete question services
 
     teacher: Mapped["User"] = relationship(back_populates="exams_created")
     sections: Mapped[List["Section"]] = relationship(
@@ -902,10 +903,12 @@ class Exam(Base, UUIDMixin, TimestampMixin):
     )
 
     __table_args__ = (
-        Index("ix_exams_teacher_id", "teacher_id"),
-        Index("ix_exams_visibility", "visibility"),
+        # Partial indexes — only index non-deleted rows (smaller, faster)
+        Index("ix_exams_teacher_active", "teacher_id",
+              postgresql_where=text("is_deleted = false")),
+        Index("ix_exams_visibility_active", "visibility",
+              postgresql_where=text("is_deleted = false AND is_active = true")),
         Index("ix_exams_scheduled_date", "scheduled_date"),
-        Index("ix_exams_active_deleted", "is_active", "is_deleted"),
     )
 
 
@@ -1650,8 +1653,9 @@ async def start_exam(
         if not exam.is_active:
             raise HTTPException(400, "Exam is not active")
 
-        question_count = len(exam.questions)
-        if question_count == 0:
+        # Use denormalized count for cost calculation (questions are still
+        # loaded via selectinload for the response payload)
+        if exam.question_count == 0:
             raise HTTPException(400, "Exam has no questions")
 
         # 2. Check if already attempted
@@ -1667,7 +1671,7 @@ async def start_exam(
         # 3. Get current cost config
         config = await db.execute(select(ExamCostConfig))
         config = config.scalar_one()
-        total_cost = config.cost_per_question * question_count
+        total_cost = config.cost_per_question * exam.question_count
 
         # 4. Determine which wallet to charge
         if exam.visibility == ExamVisibility.private:
